@@ -62,7 +62,7 @@ struct list_head {
  * 	member - the list_head element in "type"
  */
 #define list_entry(ptr, type, member) \
-	((type *)((uintptr_t)(ptr) - (uintptr_t)(&((type *)0L)->member)))
+	((type *)((uintptr_t)(ptr) - (uintptr_t)offsetof(type, member)))
 
 /* Get each entry from a list
  *	pos - A structure pointer has a "member" element
@@ -194,14 +194,14 @@ static inline void usbi_dbg(const char *format, ...)
 
 /* Internal abstractions for thread synchronization and poll */
 #if defined(THREADS_POSIX)
-#include <os/threads_posix.h>
+#include "os/threads_posix.h"
 #elif defined(OS_WINDOWS)
 #include <os/threads_windows.h>
 #endif
 
 #if defined(OS_LINUX) || defined(OS_DARWIN) || defined(OS_OPENBSD)
 #include <unistd.h>
-#include <os/poll_posix.h>
+#include "os/poll_posix.h"
 #elif defined(OS_WINDOWS)
 #include <os/poll_windows.h>
 #endif
