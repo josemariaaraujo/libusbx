@@ -21,7 +21,7 @@
 #ifndef LIBUSBI_H
 #define LIBUSBI_H
 
-#include <config.h>
+#include "config.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -30,8 +30,11 @@
 #ifdef HAVE_POLL_H
 #include <poll.h>
 #endif
+#ifdef DDKBUILD
+#include <winsock.h>	// needed for struct timeval for WDK
+#endif
 
-#include <libusb.h>
+#include "libusb.h"
 #include "version.h"
 
 /* Inside the libusbx code, mark all public functions as follows:
@@ -192,30 +195,11 @@ static inline void usbi_dbg(const char *format, ...)
 #define IS_XFERIN(xfer) (0 != ((xfer)->endpoint & LIBUSB_ENDPOINT_IN))
 #define IS_XFEROUT(xfer) (!IS_XFERIN(xfer))
 
-/* Internal abstractions for thread synchronization and poll */
+/* Internal abstraction for thread synchronization */
 #if defined(THREADS_POSIX)
 #include "os/threads_posix.h"
-#elif defined(OS_WINDOWS)
+#elif defined(OS_WINDOWS) || defined(OS_WINCE)
 #include <os/threads_windows.h>
-#endif
-
-#if defined(OS_LINUX) || defined(OS_DARWIN) || defined(OS_OPENBSD)
-#include <unistd.h>
-#include "os/poll_posix.h"
-#elif defined(OS_WINDOWS)
-#include <os/poll_windows.h>
-#endif
-
-#if defined(OS_WINDOWS) && !defined(__GCC__)
-#undef HAVE_GETTIMEOFDAY
-int usbi_gettimeofday(struct timeval *tp, void *tzp);
-#define LIBUSB_GETTIMEOFDAY_WIN32
-#define HAVE_USBI_GETTIMEOFDAY
-#else
-#ifdef HAVE_GETTIMEOFDAY
-#define usbi_gettimeofday(tv, tz) gettimeofday((tv), (tz))
-#define HAVE_USBI_GETTIMEOFDAY
-#endif
 #endif
 
 extern struct libusb_context *usbi_default_context;
@@ -407,7 +391,25 @@ int usbi_parse_descriptor(unsigned char *source, const char *descriptor,
 int usbi_get_config_index_by_value(struct libusb_device *dev,
 	uint8_t bConfigurationValue, int *idx);
 
-/* polling */
+/* Internal abstraction for poll (needs struct usbi_transfer on Windows) */
+#if defined(OS_LINUX) || defined(OS_DARWIN) || defined(OS_OPENBSD)
+#include <unistd.h>
+#include "os/poll_posix.h"
+#elif defined(OS_WINDOWS) || defined(OS_WINCE)
+#include <os/poll_windows.h>
+#endif
+
+#if (defined(OS_WINDOWS) || defined(OS_WINCE)) && !defined(__GCC__)
+#undef HAVE_GETTIMEOFDAY
+int usbi_gettimeofday(struct timeval *tp, void *tzp);
+#define LIBUSB_GETTIMEOFDAY_WIN32
+#define HAVE_USBI_GETTIMEOFDAY
+#else
+#ifdef HAVE_GETTIMEOFDAY
+#define usbi_gettimeofday(tv, tz) gettimeofday((tv), (tz))
+#define HAVE_USBI_GETTIMEOFDAY
+#endif
+#endif
 
 struct usbi_pollfd {
 	/* must come first */
@@ -906,5 +908,6 @@ extern const struct usbi_os_backend linux_usbfs_backend;
 extern const struct usbi_os_backend darwin_backend;
 extern const struct usbi_os_backend openbsd_backend;
 extern const struct usbi_os_backend windows_backend;
+extern const struct usbi_os_backend wince_backend;
 
 #endif

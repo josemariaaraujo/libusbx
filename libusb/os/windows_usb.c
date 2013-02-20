@@ -42,8 +42,6 @@
 #define LOOP_CHECK(fcall) { r=fcall; if (r != LIBUSB_SUCCESS) continue; }
 #define LOOP_BREAK(err) { r=err; continue; }
 
-extern void usbi_fd_notification(struct libusb_context *ctx);
-
 // Helper prototypes
 static int windows_get_active_config_descriptor(struct libusb_device *dev, unsigned char *buffer, size_t len, int *host_endian);
 static int windows_clock_gettime(int clk_id, struct timespec *tp);
@@ -261,7 +259,7 @@ static int init_dlls(void)
  * incremented index starting at zero) until all interfaces have been returned.
  */
 static bool get_devinfo_data(struct libusb_context *ctx,
-	HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data, char* usb_class, unsigned _index)
+	HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data, const char* usb_class, unsigned _index)
 {
 	if (_index <= 0) {
 		*dev_info = pSetupDiGetClassDevsA(NULL, usb_class, NULL, DIGCF_PRESENT|DIGCF_ALLCLASSES);
@@ -365,7 +363,7 @@ err_exit:
 }
 
 /* For libusb0 filter */
-SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details_filter(struct libusb_context *ctx,
+static SP_DEVICE_INTERFACE_DETAIL_DATA_A *get_interface_details_filter(struct libusb_context *ctx,
 	HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data, const GUID* guid, unsigned _index, char* filter_path){
 	SP_DEVICE_INTERFACE_DATA dev_interface_data;
 	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
@@ -635,7 +633,7 @@ static unsigned long get_ancestor_session_id(DWORD devinst, unsigned level)
 	if (CM_Get_Device_IDA(devinst, path, MAX_PATH_LENGTH, 0) != CR_SUCCESS) {
 		return 0;
 	}
-	// TODO (post hotplug): try without sanitizing
+	// TODO: (post hotplug): try without sanitizing
 	sanitized_path = sanitize_path(path);
 	if (sanitized_path == NULL) {
 		return 0;
@@ -688,7 +686,7 @@ static int windows_assign_endpoints(struct libusb_device_handle *dev_handle, int
 
 // Lookup for a match in the list of API driver names
 // return -1 if not found, driver match number otherwise
-int get_sub_api(char* driver, int api){
+static int get_sub_api(char* driver, int api){
 	int i;
 	const char sep_str[2] = {LIST_SEPARATOR, 0};
 	char *tok, *tmp_str;
@@ -1176,7 +1174,7 @@ static int init_device(struct libusb_device* dev, struct libusb_device* parent_d
 }
 
 // Returns the api type, or 0 if not found/unsupported
-void get_api_type(struct libusb_context *ctx, HDEVINFO *dev_info,
+static void get_api_type(struct libusb_context *ctx, HDEVINFO *dev_info,
 	SP_DEVINFO_DATA *dev_info_data, int *api, int *sub_api)
 {
 	// Precedence for filter drivers vs driver is in the order of this array
@@ -1316,7 +1314,7 @@ static int windows_get_device_list(struct libusb_context *ctx, struct discovered
 {
 	struct discovered_devs *discdevs;
 	HDEVINFO dev_info = { 0 };
-	char* usb_class[] = {"USB", "NUSB3", "IUSB3"};
+	const char* usb_class[] = {"USB", "NUSB3", "IUSB3"};
 	SP_DEVINFO_DATA dev_info_data = { 0 };
 	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
 	GUID hid_guid;
@@ -1329,7 +1327,7 @@ static int windows_get_device_list(struct libusb_context *ctx, struct discovered
 #define HID_PASS 4
 	int r = LIBUSB_SUCCESS;
 	int api, sub_api;
-	int class_index = 0;
+	size_t class_index = 0;
 	unsigned int nb_guids, pass, i, j, ancestor;
 	char path[MAX_PATH_LENGTH];
 	char strbuf[MAX_PATH_LENGTH];
@@ -2030,9 +2028,9 @@ static void windows_transfer_callback(struct usbi_transfer *itransfer, uint32_t 
 {
 	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 	struct windows_device_priv *priv = _device_priv(transfer->dev_handle->dev);
-	int status;
+	int status, istatus;
 
-	usbi_dbg("handling I/O completion with errcode %d", io_result);
+	usbi_dbg("handling I/O completion with errcode %d, size %d", io_result, io_size);
 
 	switch(io_result) {
 	case NO_ERROR:
@@ -2047,6 +2045,10 @@ static void windows_transfer_callback(struct usbi_transfer *itransfer, uint32_t 
 		status = LIBUSB_TRANSFER_TIMED_OUT;
 		break;
 	case ERROR_OPERATION_ABORTED:
+		istatus = priv->apib->copy_transfer_data(SUB_API_NOTSET, itransfer, io_size);
+		if (istatus != LIBUSB_TRANSFER_COMPLETED) {
+			usbi_dbg("Failed to copy partial data in aborted operation: %d", istatus);
+		}
 		if (itransfer->flags & USBI_TRANSFER_TIMED_OUT) {
 			usbi_dbg("detected timeout");
 			status = LIBUSB_TRANSFER_TIMED_OUT;
@@ -2056,7 +2058,7 @@ static void windows_transfer_callback(struct usbi_transfer *itransfer, uint32_t 
 		}
 		break;
 	default:
-		usbi_err(ITRANSFER_CTX(itransfer), "detected I/O error: %s", windows_error_str(0));
+		usbi_err(ITRANSFER_CTX(itransfer), "detected I/O error %d: %s", io_result, windows_error_str(0));
 		status = LIBUSB_TRANSFER_ERROR;
 		break;
 	}
@@ -2664,6 +2666,7 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 	struct windows_device_priv *priv = _device_priv(dev_handle->dev);
 	bool is_using_usbccgp = (priv->apib->id == USB_API_COMPOSITE);
 	HANDLE file_handle, winusb_handle;
+	DWORD err;
 	int i;
 	SP_DEVICE_INTERFACE_DETAIL_DATA_A *dev_interface_details = NULL;
 	HDEVINFO dev_info;
@@ -2685,15 +2688,15 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 
 		if (!WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
 			handle_priv->interface_handle[iface].api_handle = INVALID_HANDLE_VALUE;
-
-			switch(GetLastError()) {
+			err = GetLastError();
+			switch(err) {
 			case ERROR_BAD_COMMAND:
 				// The device was disconnected
 				usbi_err(ctx, "could not access interface %d: %s", iface, windows_error_str(0));
 				return LIBUSB_ERROR_NO_DEVICE;
 			default:
 				// it may be that we're using the libusb0 filter driver.
-				// [TODO] can we move this whole business into the K/0 DLL?
+				// TODO: can we move this whole business into the K/0 DLL?
 				for (i = 0; ; i++) {
 					safe_free(dev_interface_details);
 					safe_free(dev_path_no_guid);
@@ -2719,7 +2722,7 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 					}
 				}
 				if (!found_filter) {
-					usbi_err(ctx, "could not access interface %d: %s", iface, windows_error_str(0));
+					usbi_err(ctx, "could not access interface %d: %s", iface, windows_error_str(err));
 					return LIBUSB_ERROR_ACCESS;
 				}
 			}
@@ -2732,11 +2735,11 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 		// must first claim the first interface before you claim the others
 		if ((winusb_handle == 0) || (winusb_handle == INVALID_HANDLE_VALUE)) {
 			file_handle = handle_priv->interface_handle[0].dev_handle;
-			if (!WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
+			if (WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
 				handle_priv->interface_handle[0].api_handle = winusb_handle;
 				usbi_warn(ctx, "auto-claimed interface 0 (required to claim %d with WinUSB)", iface);
 			} else {
-				usbi_warn(ctx, "failed to auto-claim interface 0 (required to claim %d with WinUSB)", iface);
+				usbi_warn(ctx, "failed to auto-claim interface 0 (required to claim %d with WinUSB): %s", iface, windows_error_str(0));
 				return LIBUSB_ERROR_ACCESS;
 			}
 		}
@@ -2862,7 +2865,7 @@ static int winusbx_submit_control_transfer(int sub_api, struct usbi_transfer *it
 	usbi_dbg("will use interface %d", current_interface);
 	winusb_handle = handle_priv->interface_handle[current_interface].api_handle;
 
-	wfd = usbi_create_fd(winusb_handle, _O_RDONLY);
+	wfd = usbi_create_fd(winusb_handle, RW_READ, NULL, NULL);
 	// Always use the handle returned from usbi_create_fd (wfd.handle)
 	if (wfd.fd < 0) {
 		return LIBUSB_ERROR_NO_MEM;
@@ -2951,7 +2954,7 @@ static int winusbx_submit_bulk_transfer(int sub_api, struct usbi_transfer *itran
 
 	winusb_handle = handle_priv->interface_handle[current_interface].api_handle;
 
-	wfd = usbi_create_fd(winusb_handle, IS_XFERIN(transfer) ? _O_RDONLY : _O_WRONLY);
+	wfd = usbi_create_fd(winusb_handle, IS_XFERIN(transfer) ? RW_READ : RW_WRITE, NULL, NULL);
 	// Always use the handle returned from usbi_create_fd (wfd.handle)
 	if (wfd.fd < 0) {
 		return LIBUSB_ERROR_NO_MEM;
@@ -3057,7 +3060,7 @@ static int winusbx_abort_transfers(int sub_api, struct usbi_transfer *itransfer)
  * IOCTL_USB_HUB_CYCLE_PORT ioctl was removed from Vista => the best we can do is
  * cycle the pipes (and even then, the control pipe can not be reset using WinUSB)
  */
-// TODO (post hotplug): see if we can force eject the device and redetect it (reuse hotplug?)
+// TODO: (post hotplug): see if we can force eject the device and redetect it (reuse hotplug?)
 static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_handle)
 {
 	struct libusb_context *ctx = DEVICE_CTX(dev_handle->dev);
@@ -3628,7 +3631,7 @@ static int hid_open(int sub_api, struct libusb_device_handle *dev_handle)
 	int i, j;
 	// report IDs handling
 	ULONG size[3];
-	char* type[3] = {"input", "output", "feature"};
+	const char* type[3] = {"input", "output", "feature"};
 	int nb_ids[2];	// zero and nonzero report IDs
 
 	CHECK_HID_AVAILABLE;
@@ -3884,7 +3887,7 @@ static int hid_submit_control_transfer(int sub_api, struct usbi_transfer *itrans
 	usbi_dbg("will use interface %d", current_interface);
 	hid_handle = handle_priv->interface_handle[current_interface].api_handle;
 	// Always use the handle returned from usbi_create_fd (wfd.handle)
-	wfd = usbi_create_fd(hid_handle, _O_RDONLY);
+	wfd = usbi_create_fd(hid_handle, RW_READ, NULL, NULL);
 	if (wfd.fd < 0) {
 		return LIBUSB_ERROR_NOT_FOUND;
 	}
@@ -3990,7 +3993,7 @@ static int hid_submit_bulk_transfer(int sub_api, struct usbi_transfer *itransfer
 	hid_handle = handle_priv->interface_handle[current_interface].api_handle;
 	direction_in = transfer->endpoint & LIBUSB_ENDPOINT_IN;
 
-	wfd = usbi_create_fd(hid_handle, direction_in?_O_RDONLY:_O_WRONLY);
+	wfd = usbi_create_fd(hid_handle, direction_in?RW_READ:RW_WRITE, NULL, NULL);
 	// Always use the handle returned from usbi_create_fd (wfd.handle)
 	if (wfd.fd < 0) {
 		return LIBUSB_ERROR_NO_MEM;

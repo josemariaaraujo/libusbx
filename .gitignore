@@ -39,4 +39,4 @@ doc/html
 Debug
 Release
 *.user
-/msvc/libusb_static.sdf
+*.suo

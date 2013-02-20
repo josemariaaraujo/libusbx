@@ -18,13 +18,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <config.h>
+#include "config.h"
 #include <errno.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef HAVE_SIGNAL_H
+#include <signal.h>
+#endif
 
 #ifdef HAVE_SYS_TIME_H
 #include <sys/time.h>
@@ -1531,14 +1534,15 @@ int usbi_handle_transfer_cancellation(struct usbi_transfer *transfer)
 int API_EXPORTED libusb_try_lock_events(libusb_context *ctx)
 {
 	int r;
+	unsigned int ru;
 	USBI_GET_CONTEXT(ctx);
 
 	/* is someone else waiting to modify poll fds? if so, don't let this thread
 	 * start event handling */
 	usbi_mutex_lock(&ctx->pollfd_modify_lock);
-	r = ctx->pollfd_modify;
+	ru = ctx->pollfd_modify;
 	usbi_mutex_unlock(&ctx->pollfd_modify_lock);
-	if (r) {
+	if (ru) {
 		usbi_dbg("someone else is modifying poll fds");
 		return 1;
 	}
@@ -1621,7 +1625,7 @@ void API_EXPORTED libusb_unlock_events(libusb_context *ctx)
  */
 int API_EXPORTED libusb_event_handling_ok(libusb_context *ctx)
 {
-	int r;
+	unsigned int r;
 	USBI_GET_CONTEXT(ctx);
 
 	/* is someone else waiting to modify poll fds? if so, don't let this thread
@@ -1649,7 +1653,7 @@ int API_EXPORTED libusb_event_handling_ok(libusb_context *ctx)
  */
 int API_EXPORTED libusb_event_handler_active(libusb_context *ctx)
 {
-	int r;
+	unsigned int r;
 	USBI_GET_CONTEXT(ctx);
 
 	/* is someone else waiting to modify poll fds? if so, don't let this thread
@@ -1874,7 +1878,7 @@ static int handle_events(struct libusb_context *ctx, struct timeval *tv)
 	}
 	usbi_mutex_unlock(&ctx->pollfds_lock);
 
-	timeout_ms = (tv->tv_sec * 1000) + (tv->tv_usec / 1000);
+	timeout_ms = (int)(tv->tv_sec * 1000) + (tv->tv_usec / 1000);
 
 	/* round up to next millisecond */
 	if (tv->tv_usec % 1000)
