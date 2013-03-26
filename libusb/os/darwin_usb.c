@@ -160,7 +160,7 @@ static int ep_to_pipeRef(struct libusb_device_handle *dev_handle, uint8_t ep, ui
   return -1;
 }
 
-static int usb_setup_device_iterator (io_iterator_t *deviceIterator, long location) {
+static int usb_setup_device_iterator (io_iterator_t *deviceIterator, UInt32 location) {
   CFMutableDictionaryRef matchingDict = IOServiceMatching(kIOUSBDeviceClassName);
 
   if (!matchingDict)
@@ -172,7 +172,9 @@ static int usb_setup_device_iterator (io_iterator_t *deviceIterator, long locati
                                                                          &kCFTypeDictionaryValueCallBacks);
 
     if (propertyMatchDict) {
-      CFTypeRef locationCF = CFNumberCreate (NULL, kCFNumberLongType, &location);
+      /* there are no unsigned CFNumber types so treat the value as signed. the os seems to do this
+         internally (CFNumberType of locationID is 3) */
+      CFTypeRef locationCF = CFNumberCreate (NULL, kCFNumberSInt32Type, &location);
 
       CFDictionarySetValue (propertyMatchDict, CFSTR(kUSBDevicePropertyLocationID), locationCF);
       /* release our reference to the CFNumber (CFDictionarySetValue retains it) */
@@ -292,7 +294,7 @@ static void darwin_devices_detached (void *ptr, io_iterator_t rem_devices) {
   struct darwin_device_handle_priv *priv;
 
   io_service_t device;
-  long location;
+  UInt32 location;
   bool locationValid;
   CFTypeRef locationCF;
   UInt32 message;
@@ -309,7 +311,7 @@ static void darwin_devices_detached (void *ptr, io_iterator_t rem_devices) {
       continue;
 
     locationValid = CFGetTypeID(locationCF) == CFNumberGetTypeID() &&
-	    CFNumberGetValue(locationCF, kCFNumberLongType, &location);
+	    CFNumberGetValue(locationCF, kCFNumberSInt32Type, &location);
 
     CFRelease (locationCF);
 
@@ -1443,7 +1445,10 @@ static int submit_iso_transfer(struct usbi_transfer *itransfer) {
                                                               transfer->num_iso_packets, tpriv->isoc_framelist, darwin_async_io_callback,
                                                               itransfer);
 
-  cInterface->frames[transfer->endpoint] = frame + transfer->num_iso_packets / 8;
+  if (transfer->dev_handle->dev->speed == LIBUSB_SPEED_FULL)
+    cInterface->frames[transfer->endpoint] = frame + transfer->num_iso_packets;
+  else
+    cInterface->frames[transfer->endpoint] = frame + transfer->num_iso_packets / 8;
 
   if (kresult != kIOReturnSuccess) {
     usbi_err (TRANSFER_CTX (transfer), "isochronous transfer failed (dir: %s): %s", IS_XFERIN(transfer) ? "In" : "Out",

@@ -3,6 +3,7 @@
  * Copyright © 2001-2002 David Brownell (dbrownell@users.sourceforge.net)
  * Copyright © 2008 Roger Williams (rawqux@users.sourceforge.net)
  * Copyright © 2012 Pete Batard (pete@akeo.ie)
+ * Copyright © 2013 Federico Manzan (f.manzan@gmail.com)
  *
  *    This source code is free software; you can redistribute it
  *    and/or modify it in source code form under the terms of the GNU
@@ -130,6 +131,29 @@ static int ezusb_write(libusb_device_handle *device, const char *label,
 		logerror("%s, addr 0x%08x len %4u (0x%04x)\n", label, addr, (unsigned)len, (unsigned)len);
 	status = libusb_control_transfer(device,
 		LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+		opcode, addr & 0xFFFF, addr >> 16,
+		(unsigned char*)data, (uint16_t)len, 1000);
+	if (status != len) {
+		if (status < 0)
+			logerror("%s: %s\n", label, libusb_error_name(status));
+		else
+			logerror("%s ==> %d\n", label, status);
+	}
+	return (status < 0) ? -EIO : 0;
+}
+
+/*
+ * Issues the specified vendor-specific read request.
+ */
+static int ezusb_read(libusb_device_handle *device, const char *label,
+	uint8_t opcode, uint32_t addr, const unsigned char *data, size_t len)
+{
+	int status;
+
+	if (verbose)
+		logerror("%s, addr 0x%08x len %4u (0x%04x)\n", label, addr, (unsigned)len, (unsigned)len);
+	status = libusb_control_transfer(device,
+		LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
 		opcode, addr & 0xFFFF, addr >> 16,
 		(unsigned char*)data, (uint16_t)len, 1000);
 	if (status != len) {
@@ -503,6 +527,109 @@ static int ram_poke(void *context, uint32_t addr, bool external,
 }
 
 /*
+ * Load an Cypress Image file into target RAM.
+ * The file is assumed to be in Cypress IMG format.
+ */
+static int fx3_load_ram(libusb_device_handle *device, const char *path)
+{
+	uint32_t dCheckSum, dExpectedCheckSum, dAddress, i, dLen, dLength;
+	uint32_t* dImageBuf;
+	unsigned char *bBuf, hBuf[4], rBuf[4096];
+	FILE *image;
+
+	image = fopen(path, "rb");
+	if (image == NULL) {
+		logerror("unable to open '%s' for input\n", path);
+		return -2;
+	} else if (verbose)
+		logerror("open firmware image %s for RAM upload\n", path);
+
+	// Read header
+	if (fread(hBuf, sizeof(char), sizeof(hBuf), image) != sizeof(hBuf)) {
+		logerror("could not read image header");
+		return -3;
+	}
+
+	// check "CY" signature byte and format
+	if ((hBuf[0] != 'C') || (hBuf[1] != 'Y')) {
+		logerror("image doesn't have a CYpress signature\n");
+		return -3;
+	}
+	if (hBuf[3] != 0xB0) {
+		logerror("invalid file format 0x%02X, expected 0xB0\n", hBuf[3]);
+		return -3;
+	}
+
+	dCheckSum = 0;
+	while (1) {
+		if ((fread(&dLength, sizeof(uint32_t), 1, image) != 1) ||  // read dLength
+			(fread(&dAddress, sizeof(uint32_t), 1, image) != 1)) { // read dAddress
+			logerror("could not read image");
+			return -3;
+		}
+		if (dLength == 0)
+			break; // done
+
+		dImageBuf = calloc(dLength, sizeof(uint32_t));
+		if (dImageBuf == NULL) {
+			logerror("could not allocate buffer for image chunk\n");
+			return -4;
+		}
+
+		// read sections
+		if (fread(dImageBuf, sizeof(uint32_t), dLength, image) != dLength) {
+			logerror("could not read image");
+			free(dImageBuf);
+			return -3;
+		}
+		for (i = 0; i < dLength; i++)
+			dCheckSum += dImageBuf[i];
+		dLength <<= 2; // convert to Byte length
+		bBuf = (unsigned char*) dImageBuf;
+
+		while (dLength > 0) {
+			dLen = 4096; // 4K max
+			if (dLen > dLength)
+				dLen = dLength;
+			if ((ezusb_write(device, "write firmware", RW_INTERNAL, dAddress, bBuf, dLen) < 0) ||
+				(ezusb_read(device, "read firmware", RW_INTERNAL, dAddress, rBuf, dLen) < 0)) {
+				logerror("R/W error\n");
+				free(dImageBuf);
+				return -5;
+			}
+			// Verify data: rBuf with bBuf
+			for (i = 0; i < dLen; i++) {
+				if (rBuf[i] != bBuf[i]) {
+					logerror("verify error");
+					free(dImageBuf);
+					return -6;
+				}
+			}
+
+			dLength -= dLen;
+			bBuf += dLen;
+			dAddress += dLen;
+		}
+		free(dImageBuf);
+	}
+
+	// read pre-computed checksum data
+	if ((fread(&dExpectedCheckSum, sizeof(uint32_t), 1, image) != 1) ||
+		(dCheckSum != dExpectedCheckSum)) {
+		logerror("checksum error\n");
+		return -7;
+	}
+
+	// transfer execution to Program Entry
+	if (ezusb_write(device, "Jump command", RW_INTERNAL, dAddress, NULL, 0) < 0) {
+		logerror("failed to send jump command\n");
+		return -6;
+	}
+
+	return 0;
+}
+
+/*
  * Load a firmware file into target RAM. device is the open libusbx
  * device, and the path is the name of the source file. Open the file,
  * parse the bytes, and write them in one or two phases.
@@ -524,6 +651,9 @@ int ezusb_load_ram(libusb_device_handle *device, const char *path, int fx_type, 
 	struct ram_poke_context ctx;
 	int status;
 	uint8_t iic_header[8] = { 0 };
+
+	if (fx_type == FX_TYPE_FX3)
+		return fx3_load_ram(device, path);
 
 	image = fopen(path, "rb");
 	if (image == NULL) {

@@ -30,10 +30,10 @@
 #ifdef HAVE_POLL_H
 #include <poll.h>
 #endif
-#ifdef DDKBUILD
-#include <winsock.h>	// needed for struct timeval for WDK
-#endif
 
+#ifdef HAVE_MISSING_H
+#include "missing.h"
+#endif
 #include "libusb.h"
 #include "version.h"
 
